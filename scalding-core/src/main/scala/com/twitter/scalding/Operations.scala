@@ -27,7 +27,7 @@ import org.apache.hadoop.conf.Configuration
 
 import com.esotericsoftware.kryo.Kryo;
 
-import com.twitter.algebird.{Semigroup, SummingCache}
+import com.twitter.algebird.{Semigroup}
 import com.twitter.scalding.mathematics.Poisson
 import serialization.Externalizer
 
@@ -68,6 +68,127 @@ import serialization.Externalizer
       }
     }
 }
+
+import java.util.concurrent.ArrayBlockingQueue
+
+import java.util.{ LinkedHashMap => JLinkedHashMap, Map => JMap }
+import scala.collection.mutable.{Map => MMap, ListBuffer}
+import scala.collection.JavaConverters._
+import scala.annotation.tailrec
+import com.twitter.algebird.{StatefulSummer, MapMonoid}
+
+object SummingCache {
+  def apply[K,V:Semigroup](cap: Int): SummingCache[K,V] = new SummingCache[K,V](cap)
+}
+
+
+class ValStats {
+  private var v_0_to_9: Long = 0
+  private var v_10_to_99: Long = 0
+  private var v_100_to_999: Long = 0
+  private var v_over_1000: Long = 0
+  private var count: Long = 0
+  private var total: Float = 0
+
+  def put(v: Int) {
+    count += 1
+    total += v
+    if (v < 10) v_0_to_9 += 1
+    else if (v < 100) v_10_to_99 += 1
+    else if (v < 1000) v_100_to_999 += 1
+    else v_over_1000 += 1
+  }
+
+  override def toString = {
+    "[<10:" + v_0_to_9 + ", >=10 <100:" + v_10_to_99 + ", >=100 <1000:" + v_100_to_999 + ", >=1000:" + v_over_1000 +
+    ", avg=" + total / count + " count=" + count + "]"
+  }
+}
+
+/** A Stateful Summer on Map[K,V] that keeps a cache of recent keys
+ *  @author Julien Le Dem
+ */
+class SummingCache[K,V] private (capacity: Int)(implicit sgv: Semigroup[V]) extends StatefulSummer[Map[K,V]] {
+
+  require(capacity >= 0, "Cannot have negative capacity in SummingIterator")
+
+  override val semigroup = new MapMonoid[K,V]
+
+  private var presentTuples = 0
+  private val cache = MMap[K, ListBuffer[V]]()
+
+  private val sumCallsStats = new ValStats
+  private val flushKeySizeStats = new ValStats
+
+  override def put(m: Map[K,V]): Option[Map[K,V]] = {
+    m.foreach { case (k, v) =>
+        cache.getOrElseUpdate(k, ListBuffer[V]()) += v
+      }
+    presentTuples += m.size
+
+//    // if the number of distinct keys fits in the buffer, we just aggregate values
+//    if (presentTuples >= capacity && cache.size < capacity) aggregateCache
+
+    // if they don't we need to flush
+    if (presentTuples >= capacity)
+      innerFlush
+    else
+      None
+  }
+
+  private def sum(items: Seq[V]): Option[V] = {
+    if (items.size == 1) {
+      Some(items.head)
+    } else {
+      sumOption(items)
+    }
+  }
+
+  private def sumOption(items: Seq[V]): Option[V] = {
+    sumCallsStats.put(items.size)
+    sgv.sumOption(items)
+  }
+
+  /**
+   * aggregates each value list in the cache in place
+   */
+  private def aggregateCache() = {
+    var newCount = 0
+    cache.foreach { case (k, listV) =>
+      if (listV.size > 2) { // we don't want to aggregate if the list is not big enough
+        val sum = sumOption(listV)
+        listV.clear
+        sum.foreach((v) => listV += v)
+      }
+      newCount += listV.size
+    }
+    presentTuples = newCount
+  }
+
+  /**
+   * aggregate and write the cache to the output
+   */
+  override def flush: Option[Map[K,V]] = {
+    val r = innerFlush
+    println("sumOption calls: " + sumCallsStats)
+    println("flushes key size: " + flushKeySizeStats)
+    r
+  }
+
+  private def innerFlush: Option[Map[K,V]] = {
+    flushKeySizeStats.put(cache.size)
+    val flushed = cache.toMap.flatMap{ case (k, listV) =>
+        sum(listV).map(v => (k, v))
+      }
+     presentTuples = 0
+     cache.clear
+     if (flushed.isEmpty) None else Some(flushed)
+  }
+
+  def isFlushed = presentTuples == 0
+
+}
+
 
   /** An implementation of map-side combining which is appropriate for associative and commutative functions
    * If a cacheSize is given, it is used, else we query
